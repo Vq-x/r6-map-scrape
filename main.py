@@ -1,6 +1,9 @@
 import asyncio
 import re
 from pathlib import Path
+from email.utils import parsedate_to_datetime
+from datetime import UTC, datetime
+from typing import cast
 from urllib.parse import unquote, urljoin, urlparse
 
 import bs4
@@ -9,6 +12,9 @@ import httpx
 BASE_URL = "https://www.ubisoft.com"
 MAPS_URL = f"{BASE_URL}/en-us/game/rainbow-six/siege/game-info/maps"
 DOWNLOAD_DIR = Path("blueprints")
+MAX_RETRIES = 5
+MAP_REQUEST_CONCURRENCY = 3
+DOWNLOAD_CONCURRENCY = 4
 
 
 def parse_map_links(html: str) -> list[str]:
@@ -47,21 +53,64 @@ def filename_from_url(url: str) -> str:
     return re.sub(r'[<>:"/\\|?*]', "_", filename)
 
 
+def retry_after_seconds(response: httpx.Response) -> float | None:
+    retry_after = cast(str | None, response.headers.get("Retry-After"))
+    if retry_after is None:
+        return None
+
+    if retry_after.isdecimal():
+        return float(retry_after)
+
+    try:
+        retry_at = parsedate_to_datetime(retry_after)
+    except (TypeError, ValueError):
+        return None
+
+    if retry_at.tzinfo is None:
+        retry_at = retry_at.replace(tzinfo=UTC)
+
+    return max(0.0, (retry_at - datetime.now(UTC)).total_seconds())
+
+
+async def request_with_retries(
+    client: httpx.AsyncClient, method: str, url: str
+) -> httpx.Response:
+    for attempt in range(MAX_RETRIES + 1):
+        response = await client.request(method, url)
+        if response.status_code != 429:
+            _ = response.raise_for_status()
+            return response
+
+        await response.aclose()
+        if attempt == MAX_RETRIES:
+            _ = response.raise_for_status()
+
+        delay = retry_after_seconds(response) or min(2.0**attempt, 30.0)
+        print(f"Rate limited by Ubisoft. Retrying {url} in {delay:.1f}s")
+        await asyncio.sleep(delay)
+
+    raise RuntimeError("unreachable retry state")
+
+
 async def get_map_links(client: httpx.AsyncClient) -> list[str]:
-    response = await client.get(MAPS_URL)
-    _ = response.raise_for_status()
+    response = await request_with_retries(client, "GET", MAPS_URL)
     return parse_map_links(response.text)
 
 
 async def get_blueprint_link(client: httpx.AsyncClient, map_link: str) -> str | None:
-    response = await client.get(map_link)
-    _ = response.raise_for_status()
+    response = await request_with_retries(client, "GET", map_link)
     return parse_blueprint_link(response.text, map_link)
 
 
 async def get_blueprint_links(client: httpx.AsyncClient, map_links: list[str]) -> list[str]:
+    semaphore = asyncio.Semaphore(MAP_REQUEST_CONCURRENCY)
+
+    async def limited_get_blueprint_link(map_link: str) -> str | None:
+        async with semaphore:
+            return await get_blueprint_link(client, map_link)
+
     results = await asyncio.gather(
-        *(get_blueprint_link(client, map_link) for map_link in map_links)
+        *(limited_get_blueprint_link(map_link) for map_link in map_links)
     )
     return [link for link in results if link is not None]
 
@@ -72,11 +121,9 @@ async def download_zip(
     download_dir.mkdir(parents=True, exist_ok=True)
     destination = download_dir / filename_from_url(blueprint_link)
 
-    async with client.stream("GET", blueprint_link) as response:
-        _ = response.raise_for_status()
-        with destination.open("wb") as file:
-            async for chunk in response.aiter_bytes():
-                _ = file.write(chunk)
+    response = await request_with_retries(client, "GET", blueprint_link)
+    with destination.open("wb") as file:
+        _ = file.write(response.content)
 
     return destination
 
@@ -84,8 +131,14 @@ async def download_zip(
 async def download_blueprints(
     client: httpx.AsyncClient, blueprint_links: list[str], download_dir: Path
 ) -> list[Path]:
+    semaphore = asyncio.Semaphore(DOWNLOAD_CONCURRENCY)
+
+    async def limited_download_zip(blueprint_link: str) -> Path:
+        async with semaphore:
+            return await download_zip(client, blueprint_link, download_dir)
+
     return await asyncio.gather(
-        *(download_zip(client, link, download_dir) for link in blueprint_links)
+        *(limited_download_zip(link) for link in blueprint_links)
     )
 
 
