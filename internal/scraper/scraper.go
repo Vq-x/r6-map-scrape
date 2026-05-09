@@ -182,7 +182,11 @@ func (s *Scraper) requestWithRetries(ctx context.Context, method, rawURL string)
 	return nil, lastErr
 }
 
-var anchorRE = regexp.MustCompile(`(?is)<a\b[^>]*>`)
+var (
+	anchorRE    = regexp.MustCompile(`(?is)<a\b[^>]*>`)
+	classAttrRE = regexp.MustCompile(`(?is)\sclass\s*=\s*("([^"]*)"|'([^']*)'|([^\s>]+))`)
+	hrefAttrRE  = regexp.MustCompile(`(?is)\shref\s*=\s*("([^"]*)"|'([^']*)'|([^\s>]+))`)
+)
 
 func ParseMapLinks(html, baseURL string) []string {
 	var links []string
@@ -247,7 +251,15 @@ func ResolveURL(baseURL, ref string) string {
 }
 
 func attr(tag, name string) string {
-	re := regexp.MustCompile(`(?is)\s` + regexp.QuoteMeta(name) + `\s*=\s*("([^"]*)"|'([^']*)'|([^\s>]+))`)
+	var re *regexp.Regexp
+	switch name {
+	case "class":
+		re = classAttrRE
+	case "href":
+		re = hrefAttrRE
+	default:
+		return ""
+	}
 	match := re.FindStringSubmatch(tag)
 	if len(match) == 0 {
 		return ""

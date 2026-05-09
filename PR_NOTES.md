@@ -19,6 +19,18 @@
   - `GOCACHE=/tmp/go-build-cache go test ./...`
   - `GOCACHE=/tmp/go-build-cache go run ./cmd/r6-map-scrape -h`
 
+## Performance
+
+Local CPU benchmarks against equivalent Python hot paths show the Go port is faster:
+
+- Parse 80 map cards: ~5.0x faster after optimization.
+- Parse blueprint link: ~13.2x faster after optimization.
+- Filename from URL: ~9.0x faster.
+
+During benchmarking, `attr()` was optimized to use precompiled `class`/`href` regexes, reducing map-card parsing from ~1.06 ms/op to ~0.38 ms/op and blueprint-link parsing from ~148 µs/op to ~36 µs/op.
+
+Detailed report: `/home/vqx/openclaw-workspace/research/r6-scraper-go-port-performance-report.md`.
+
 ## Blockers
 
 - Worker sandbox could not create the nested `feature/go-port` branch or commit; the main session created `feature-go-port-map` and handled commit/cleanup.
